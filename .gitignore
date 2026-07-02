@@ -1,0 +1,15 @@
+# Python environment
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Google API Credentials & Configuration
+credentials.json
+token.json
+config.json
+
+# Runtime tracking & Logs
+sync.pid
+sync.log
