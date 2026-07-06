@@ -59,27 +59,103 @@ def download_file(file_id, local_path, service):
         logging.error(f"Error downloading file {file_id} to {local_path}: {e}")
         return False
 
-def list_drive_files(service, folder_id):
-    drive_files = []
+drive_folder_id_cache = {}
+
+def is_ignored_path(path, local_dir):
+    rel_path = os.path.relpath(path, local_dir)
+    parts = rel_path.split(os.sep)
+    for part in parts:
+        if part.startswith('.') and part != '.' and part != '..':
+            return True
+    return False
+
+def get_or_create_drive_folder(local_dir, file_path, root_folder_id, service):
+    file_dir = os.path.dirname(file_path)
+    rel_dir = os.path.relpath(file_dir, local_dir)
+    
+    if rel_dir == '.':
+        return root_folder_id
+        
+    normalized_rel_dir = os.path.normpath(rel_dir)
+    if normalized_rel_dir in drive_folder_id_cache:
+        return drive_folder_id_cache[normalized_rel_dir]
+        
+    parts = normalized_rel_dir.split(os.sep)
+    current_parent_id = root_folder_id
+    current_rel_path = ""
+    
+    for part in parts:
+        current_rel_path = os.path.join(current_rel_path, part) if current_rel_path else part
+        normalized_part_path = os.path.normpath(current_rel_path)
+        
+        if normalized_part_path in drive_folder_id_cache:
+            current_parent_id = drive_folder_id_cache[normalized_part_path]
+            continue
+            
+        q = f"name = '{part}' and '{current_parent_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        try:
+            results = service.files().list(q=q, fields="files(id, name)").execute()
+            folders = results.get('files', [])
+            if folders:
+                folder_id = folders[0]['id']
+            else:
+                folder_metadata = {
+                    'name': part,
+                    'mimeType': 'application/vnd.google-apps.folder',
+                    'parents': [current_parent_id]
+                }
+                new_folder = service.files().create(body=folder_metadata, fields='id').execute()
+                folder_id = new_folder.get('id')
+                logging.info(f"Created subfolder on Google Drive: '{part}' (ID: {folder_id})")
+                
+            drive_folder_id_cache[normalized_part_path] = folder_id
+            current_parent_id = folder_id
+        except Exception as e:
+            logging.error(f"Error resolving Google Drive folder '{part}' under '{current_parent_id}': {e}")
+            raise e
+            
+    return current_parent_id
+
+def list_drive_files_recursive(service, folder_id, current_rel_path=""):
+    drive_items = []
     page_token = None
     q = f"'{folder_id}' in parents and trashed = false"
     while True:
         try:
             results = service.files().list(
                 q=q,
-                fields="nextPageToken, files(id, name, modifiedTime)",
+                fields="nextPageToken, files(id, name, modifiedTime, mimeType)",
                 pageToken=page_token
             ).execute()
-            drive_files.extend(results.get('files', []))
+            files = results.get('files', [])
+            for f in files:
+                name = f.get('name')
+                item_id = f.get('id')
+                mime_type = f.get('mimeType')
+                is_dir = (mime_type == 'application/vnd.google-apps.folder')
+                rel_path = os.path.join(current_rel_path, name) if current_rel_path else name
+                
+                drive_items.append({
+                    'id': item_id,
+                    'name': name,
+                    'modifiedTime': f.get('modifiedTime'),
+                    'rel_path': rel_path,
+                    'is_dir': is_dir
+                })
+                
+                if is_dir:
+                    sub_items = list_drive_files_recursive(service, item_id, rel_path)
+                    drive_items.extend(sub_items)
+                    
             page_token = results.get('nextPageToken')
             if not page_token:
                 break
         except Exception as e:
-            logging.error(f"Error listing Google Drive files: {e}")
+            logging.error(f"Error listing Google Drive files in folder {folder_id}: {e}")
             break
-    return drive_files
+    return drive_items
 
-def sync_file(file_path, folder_id, service):
+def sync_file(file_path, local_dir, root_folder_id, service):
     if not os.path.exists(file_path):
         return
     
@@ -100,14 +176,14 @@ def sync_file(file_path, folder_id, service):
         return
 
     try:
-        # Search if file already exists in target Drive folder
-        q = f"name = '{filename}' and '{folder_id}' in parents and trashed = false"
+        target_folder_id = get_or_create_drive_folder(local_dir, file_path, root_folder_id, service)
+        
+        q = f"name = '{filename}' and '{target_folder_id}' in parents and trashed = false"
         results = service.files().list(q=q, fields="files(id, name)").execute()
         files = results.get('files', [])
         
         media = MediaFileUpload(file_path, mimetype='text/markdown', resumable=True)
         
-        # Get local modification time and format to RFC 3339
         local_mtime = os.path.getmtime(file_path)
         local_dt = datetime.datetime.fromtimestamp(local_mtime, tz=datetime.timezone.utc)
         modified_time_str = local_dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
@@ -123,7 +199,7 @@ def sync_file(file_path, folder_id, service):
         else:
             file_metadata = {
                 'name': filename,
-                'parents': [folder_id],
+                'parents': [target_folder_id],
                 'modifiedTime': modified_time_str
             }
             new_file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
@@ -134,13 +210,14 @@ def sync_file(file_path, folder_id, service):
     except Exception as e:
         logging.error(f"Unexpected error syncing {filename}: {e}")
 
-def delete_file(file_path, folder_id, service):
+def delete_file(file_path, local_dir, root_folder_id, service):
     filename = os.path.basename(file_path)
     logging.info(f"Deleting file from Drive: {filename}")
     
     try:
-        # Search for file on Drive
-        q = f"name = '{filename}' and '{folder_id}' in parents and trashed = false"
+        target_folder_id = get_or_create_drive_folder(local_dir, file_path, root_folder_id, service)
+        
+        q = f"name = '{filename}' and '{target_folder_id}' in parents and trashed = false"
         results = service.files().list(q=q, fields="files(id, name)").execute()
         files = results.get('files', [])
         
@@ -161,28 +238,43 @@ def delete_file(file_path, folder_id, service):
 def initial_sync(service, local_dir, folder_id):
     logging.info("Starting initial startup synchronization...")
     
-    # 1. List all local .md files
+    # 1. List all local .md files recursively (excluding ignored)
     local_files = {}
     try:
-        for item in os.listdir(local_dir):
-            local_path = os.path.join(local_dir, item)
-            if os.path.isfile(local_path) and item.lower().endswith('.md'):
-                local_files[item] = local_path
+        for root, dirs, files in os.walk(local_dir):
+            # Skip hidden directories in-place
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
+            for file in files:
+                if file.lower().endswith('.md'):
+                    local_path = os.path.join(root, file)
+                    rel_path = os.path.relpath(local_path, local_dir)
+                    normalized_rel_path = os.path.normpath(rel_path)
+                    local_files[normalized_rel_path] = local_path
     except Exception as e:
         logging.error(f"Error listing local files: {e}")
         return
 
-    # 2. List all Drive files
-    drive_files = list_drive_files(service, folder_id)
+    # 2. List all Drive files recursively
+    drive_items = list_drive_files_recursive(service, folder_id)
     
+    # Cache existing directories on Drive to avoid redundant API queries
+    for item in drive_items:
+        if item['is_dir']:
+            normalized_rel_path = os.path.normpath(item['rel_path'])
+            drive_folder_id_cache[normalized_rel_path] = item['id']
+            
     # Track files to process
-    for drive_file in drive_files:
-        filename = drive_file.get('name')
-        if not filename or not filename.lower().endswith('.md'):
+    for item in drive_items:
+        if item['is_dir']:
             continue
             
-        file_id = drive_file.get('id')
-        gdrive_modified_str = drive_file.get('modifiedTime')
+        filename = item['name']
+        if not filename.lower().endswith('.md'):
+            continue
+            
+        rel_path = os.path.normpath(item['rel_path'])
+        file_id = item['id']
+        gdrive_modified_str = item['modifiedTime']
         
         # Parse Google Drive modifiedTime (UTC)
         gdrive_mtime = None
@@ -190,84 +282,87 @@ def initial_sync(service, local_dir, folder_id):
             try:
                 gdrive_mtime = datetime.datetime.fromisoformat(gdrive_modified_str.replace('Z', '+00:00')).timestamp()
             except Exception as e:
-                logging.warning(f"Could not parse modification time for {filename}: {e}")
+                logging.warning(f"Could not parse modification time for {rel_path}: {e}")
             
-        local_path = os.path.join(local_dir, filename)
+        local_path = os.path.join(local_dir, rel_path)
         
-        if filename in local_files:
+        if rel_path in local_files:
             # File exists both locally and on Drive
             if gdrive_mtime is not None:
                 try:
                     local_mtime = os.path.getmtime(local_path)
                 except Exception as e:
-                    logging.warning(f"Could not get local modification time for {filename}: {e}")
+                    logging.warning(f"Could not get local modification time for {rel_path}: {e}")
                     local_mtime = 0
                 
                 # Check diff
-                # If Drive is newer (by more than 2 seconds)
                 if gdrive_mtime > local_mtime + 2:
-                    logging.info(f"Drive file '{filename}' is newer. Downloading update...")
+                    logging.info(f"Drive file '{rel_path}' is newer. Downloading update...")
                     if download_file(file_id, local_path, service):
                         try:
                             os.utime(local_path, (gdrive_mtime, gdrive_mtime))
                         except Exception as e:
-                            logging.warning(f"Could not set local modification time for {filename}: {e}")
-                # If Local is newer (by more than 2 seconds)
+                            logging.warning(f"Could not set local modification time for {rel_path}: {e}")
                 elif local_mtime > gdrive_mtime + 2:
-                    logging.info(f"Local file '{filename}' is newer. Uploading update...")
-                    sync_file(local_path, folder_id, service)
+                    logging.info(f"Local file '{rel_path}' is newer. Uploading update...")
+                    sync_file(local_path, local_dir, folder_id, service)
                 else:
-                    logging.debug(f"File '{filename}' is in sync.")
+                    logging.debug(f"File '{rel_path}' is in sync.")
             else:
                 pass
                 
             # Remove from local files dict so we know it's been handled
-            del local_files[filename]
+            del local_files[rel_path]
         else:
             # File exists on Drive but not locally
-            logging.info(f"Downloading new file from Drive: '{filename}'")
+            logging.info(f"Downloading new file from Drive: '{rel_path}'")
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
             if download_file(file_id, local_path, service):
                 if gdrive_mtime is not None:
                     try:
                         os.utime(local_path, (gdrive_mtime, gdrive_mtime))
                     except Exception as e:
-                        logging.warning(f"Could not set local modification time for {filename}: {e}")
+                        logging.warning(f"Could not set local modification time for {rel_path}: {e}")
 
     # 3. Any files left in local_files exist locally but not on Drive
-    for filename, local_path in local_files.items():
-        logging.info(f"Uploading new local file to Drive: '{filename}'")
-        sync_file(local_path, folder_id, service)
+    for rel_path, local_path in local_files.items():
+        logging.info(f"Uploading new local file to Drive: '{rel_path}'")
+        sync_file(local_path, local_dir, folder_id, service)
         
     logging.info("Initial synchronization completed successfully.")
 
 class MarkdownSyncHandler(FileSystemEventHandler):
-    def __init__(self, service, folder_id):
+    def __init__(self, service, local_dir, folder_id):
         self.service = service
+        self.local_dir = local_dir
         self.folder_id = folder_id
 
     def on_created(self, event):
         if not event.is_directory and event.src_path.lower().endswith('.md'):
-            logging.info(f"Detected creation event: {event.src_path}")
-            sync_file(event.src_path, self.folder_id, self.service)
+            if not is_ignored_path(event.src_path, self.local_dir):
+                logging.info(f"Detected creation event: {event.src_path}")
+                sync_file(event.src_path, self.local_dir, self.folder_id, self.service)
 
     def on_modified(self, event):
         if not event.is_directory and event.src_path.lower().endswith('.md'):
-            logging.info(f"Detected modification event: {event.src_path}")
-            sync_file(event.src_path, self.folder_id, self.service)
+            if not is_ignored_path(event.src_path, self.local_dir):
+                logging.info(f"Detected modification event: {event.src_path}")
+                sync_file(event.src_path, self.local_dir, self.folder_id, self.service)
 
     def on_deleted(self, event):
         if not event.is_directory and event.src_path.lower().endswith('.md'):
-            logging.info(f"Detected deletion event: {event.src_path}")
-            delete_file(event.src_path, self.folder_id, self.service)
+            if not is_ignored_path(event.src_path, self.local_dir):
+                logging.info(f"Detected deletion event: {event.src_path}")
+                delete_file(event.src_path, self.local_dir, self.folder_id, self.service)
 
     def on_moved(self, event):
         if not event.is_directory:
-            if event.src_path.lower().endswith('.md'):
+            if event.src_path.lower().endswith('.md') and not is_ignored_path(event.src_path, self.local_dir):
                 logging.info(f"Detected file moved out / renamed: {event.src_path}")
-                delete_file(event.src_path, self.folder_id, self.service)
-            if event.dest_path.lower().endswith('.md'):
+                delete_file(event.src_path, self.local_dir, self.folder_id, self.service)
+            if event.dest_path.lower().endswith('.md') and not is_ignored_path(event.dest_path, self.local_dir):
                 logging.info(f"Detected file moved in / renamed: {event.dest_path}")
-                sync_file(event.dest_path, self.folder_id, self.service)
+                sync_file(event.dest_path, self.local_dir, self.folder_id, self.service)
 
 def load_config(config_path):
     if not os.path.exists(config_path):
@@ -345,9 +440,9 @@ def main():
     # Perform initial bidirectional sync before starting watchdog observer
     initial_sync(service, local_dir, folder_id)
         
-    event_handler = MarkdownSyncHandler(service, folder_id)
+    event_handler = MarkdownSyncHandler(service, local_dir, folder_id)
     observer = Observer()
-    observer.schedule(event_handler, path=local_dir, recursive=False)
+    observer.schedule(event_handler, path=local_dir, recursive=True)
     observer.start()
     
     logging.info("Watchdog observer started. Monitoring...")
