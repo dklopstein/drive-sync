@@ -4,6 +4,7 @@ import time
 import json
 import logging
 import argparse
+import datetime
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -47,6 +48,37 @@ def get_drive_service():
             token.write(creds.to_json())
     return build('drive', 'v3', credentials=creds, cache_discovery=False)
 
+def download_file(file_id, local_path, service):
+    try:
+        request = service.files().get_media(fileId=file_id)
+        file_content = request.execute()
+        with open(local_path, 'wb') as f:
+            f.write(file_content)
+        return True
+    except Exception as e:
+        logging.error(f"Error downloading file {file_id} to {local_path}: {e}")
+        return False
+
+def list_drive_files(service, folder_id):
+    drive_files = []
+    page_token = None
+    q = f"'{folder_id}' in parents and trashed = false"
+    while True:
+        try:
+            results = service.files().list(
+                q=q,
+                fields="nextPageToken, files(id, name, modifiedTime)",
+                pageToken=page_token
+            ).execute()
+            drive_files.extend(results.get('files', []))
+            page_token = results.get('nextPageToken')
+            if not page_token:
+                break
+        except Exception as e:
+            logging.error(f"Error listing Google Drive files: {e}")
+            break
+    return drive_files
+
 def sync_file(file_path, folder_id, service):
     if not os.path.exists(file_path):
         return
@@ -75,14 +107,24 @@ def sync_file(file_path, folder_id, service):
         
         media = MediaFileUpload(file_path, mimetype='text/markdown', resumable=True)
         
+        # Get local modification time and format to RFC 3339
+        local_mtime = os.path.getmtime(file_path)
+        local_dt = datetime.datetime.fromtimestamp(local_mtime, tz=datetime.timezone.utc)
+        modified_time_str = local_dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+        
         if files:
             file_id = files[0]['id']
-            service.files().update(fileId=file_id, media_body=media).execute()
+            service.files().update(
+                fileId=file_id,
+                body={'modifiedTime': modified_time_str},
+                media_body=media
+            ).execute()
             logging.info(f"Successfully updated file on Drive: {filename} (ID: {file_id})")
         else:
             file_metadata = {
                 'name': filename,
-                'parents': [folder_id]
+                'parents': [folder_id],
+                'modifiedTime': modified_time_str
             }
             new_file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
             logging.info(f"Successfully created file on Drive: {filename} (ID: {new_file.get('id')})")
@@ -115,6 +157,88 @@ def delete_file(file_path, folder_id, service):
         logging.error(f"Google Drive API error deleting {filename}: {error}")
     except Exception as e:
         logging.error(f"Unexpected error deleting {filename}: {e}")
+
+def initial_sync(service, local_dir, folder_id):
+    logging.info("Starting initial startup synchronization...")
+    
+    # 1. List all local .md files
+    local_files = {}
+    try:
+        for item in os.listdir(local_dir):
+            local_path = os.path.join(local_dir, item)
+            if os.path.isfile(local_path) and item.lower().endswith('.md'):
+                local_files[item] = local_path
+    except Exception as e:
+        logging.error(f"Error listing local files: {e}")
+        return
+
+    # 2. List all Drive files
+    drive_files = list_drive_files(service, folder_id)
+    
+    # Track files to process
+    for drive_file in drive_files:
+        filename = drive_file.get('name')
+        if not filename or not filename.lower().endswith('.md'):
+            continue
+            
+        file_id = drive_file.get('id')
+        gdrive_modified_str = drive_file.get('modifiedTime')
+        
+        # Parse Google Drive modifiedTime (UTC)
+        gdrive_mtime = None
+        if gdrive_modified_str:
+            try:
+                gdrive_mtime = datetime.datetime.fromisoformat(gdrive_modified_str.replace('Z', '+00:00')).timestamp()
+            except Exception as e:
+                logging.warning(f"Could not parse modification time for {filename}: {e}")
+            
+        local_path = os.path.join(local_dir, filename)
+        
+        if filename in local_files:
+            # File exists both locally and on Drive
+            if gdrive_mtime is not None:
+                try:
+                    local_mtime = os.path.getmtime(local_path)
+                except Exception as e:
+                    logging.warning(f"Could not get local modification time for {filename}: {e}")
+                    local_mtime = 0
+                
+                # Check diff
+                # If Drive is newer (by more than 2 seconds)
+                if gdrive_mtime > local_mtime + 2:
+                    logging.info(f"Drive file '{filename}' is newer. Downloading update...")
+                    if download_file(file_id, local_path, service):
+                        try:
+                            os.utime(local_path, (gdrive_mtime, gdrive_mtime))
+                        except Exception as e:
+                            logging.warning(f"Could not set local modification time for {filename}: {e}")
+                # If Local is newer (by more than 2 seconds)
+                elif local_mtime > gdrive_mtime + 2:
+                    logging.info(f"Local file '{filename}' is newer. Uploading update...")
+                    sync_file(local_path, folder_id, service)
+                else:
+                    logging.debug(f"File '{filename}' is in sync.")
+            else:
+                pass
+                
+            # Remove from local files dict so we know it's been handled
+            del local_files[filename]
+        else:
+            # File exists on Drive but not locally
+            logging.info(f"Downloading new file from Drive: '{filename}'")
+            if download_file(file_id, local_path, service):
+                if gdrive_mtime is not None:
+                    try:
+                        os.utime(local_path, (gdrive_mtime, gdrive_mtime))
+                    except Exception as e:
+                        logging.warning(f"Could not set local modification time for {filename}: {e}")
+
+    # 3. Any files left in local_files exist locally but not on Drive
+    for filename, local_path in local_files.items():
+        logging.info(f"Uploading new local file to Drive: '{filename}'")
+        sync_file(local_path, folder_id, service)
+        
+    logging.info("Initial synchronization completed successfully.")
 
 class MarkdownSyncHandler(FileSystemEventHandler):
     def __init__(self, service, folder_id):
@@ -217,6 +341,9 @@ def main():
         logging.info(f"Started sync process with PID {os.getpid()}")
     except Exception as e:
         logging.warning(f"Could not write PID file: {e}")
+        
+    # Perform initial bidirectional sync before starting watchdog observer
+    initial_sync(service, local_dir, folder_id)
         
     event_handler = MarkdownSyncHandler(service, folder_id)
     observer = Observer()
