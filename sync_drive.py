@@ -227,8 +227,8 @@ def delete_file(file_path, local_dir, root_folder_id, service):
             
         for file in files:
             file_id = file['id']
-            service.files().delete(fileId=file_id).execute()
-            logging.info(f"Successfully deleted file from Drive: {filename} (ID: {file_id})")
+            service.files().update(fileId=file_id, body={'trashed': True}).execute()
+            logging.info(f"Successfully trashed file on Drive: {filename} (ID: {file_id})")
             
     except HttpError as error:
         logging.error(f"Google Drive API error deleting {filename}: {error}")
