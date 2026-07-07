@@ -2,17 +2,33 @@
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $scriptDir
 
-# Check if sync is already running
+# =====================================================================
+# CLEAN RESET ZONE: Kill any existing background sync processes
+# =====================================================================
+Write-Host "Initiating sync engine reset..." -ForegroundColor Cyan
+
+# 1. Kill process listed in sync.pid if running
 if (Test-Path "sync.pid") {
     $oldPid = Get-Content "sync.pid" -Raw
     if (Get-Process -Id $oldPid -ErrorAction SilentlyContinue) {
-        Write-Host "Sync process is already running with PID $oldPid." -ForegroundColor Yellow
-        exit
-    } else {
-        # PID file exists but process is not running, clean up
-        Remove-Item "sync.pid" -Force
+        Write-Host "Stopping sync process with PID $oldPid from sync.pid..." -ForegroundColor Yellow
+        Stop-Process -Id $oldPid -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item "sync.pid" -Force
+}
+
+# 2. Kill all other running python/pythonw sync processes executing sync_drive.py
+$currentPID = $PID
+$oldProcesses = Get-CimInstance Win32_Process -Filter "Name LIKE 'python%' AND CommandLine LIKE '%sync_drive%'"
+foreach ($proc in $oldProcesses) {
+    if ($proc.ProcessId -ne $currentPID) {
+        Write-Host "Stopping frozen sync engine instance (PID: $($proc.ProcessId))" -ForegroundColor Yellow
+        Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
     }
 }
+
+# Short pause to let the operating system release file locks
+Start-Sleep -Seconds 2
 
 # Ensure config.json and credentials.json exist
 if (-not (Test-Path "config.json")) {
